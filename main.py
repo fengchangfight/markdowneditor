@@ -22,6 +22,9 @@ BASE_DIR = Path(__file__).parent.resolve()
 IMAGE_EXTS = {'.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.bmp', '.ico'}
 TEXT_EXTS = {'.css', '.js', '.md', '.html', '.txt', '.json', '.xml', '.csv'}
 
+# In-memory content cache: filename -> (mtime, content)
+_CONTENT_CACHE = {}
+
 HTML = r"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -61,12 +64,15 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;d
 .toastui-editor-defaultUI{border:none!important;border-radius:0!important}
 #editor-container.src-only .toastui-editor-md-preview{display:none!important}
 #editor-container.prv-only .toastui-editor-md-editor{display:none!important}
+#search-box{width:100%;padding:6px 8px;border:1px solid #ddd;border-radius:4px;font-size:13px;outline:none;margin-bottom:8px}
+#search-box:focus{border-color:#4a90d9}
 </style>
 </head>
 <body>
 <div id="sidebar">
   <div id="sidebar-header">
     <h2>📝 Markdown Files</h2>
+    <input id="search-box" type="text" placeholder="Search title / content..." oninput="onSearch()">
     <button onclick="createFile()">+ New File</button>
   </div>
   <div id="file-list"></div>
@@ -280,6 +286,47 @@ document.addEventListener('keydown', function(e) {
     }
 });
 
+var searchTimer = null;
+
+function onSearch() {
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(doSearch, 250);
+}
+
+function doSearch() {
+    var q = document.getElementById('search-box').value.trim();
+    if (!q) { loadFileList(); return; }
+    fetch('/api/search?q=' + encodeURIComponent(q)).then(function(r){return r.json()}).then(function(r){
+        renderSearchResults(r, q);
+    });
+}
+
+function renderSearchResults(results, q) {
+    var list = document.getElementById('file-list');
+    if (results.length === 0) {
+        list.innerHTML = '<div style="padding:12px;color:#999;font-size:13px">No results</div>';
+        return;
+    }
+    var html = '';
+    for (var i = 0; i < results.length; i++) {
+        var r = results[i];
+        html += '<div class="file-item" onclick="openFile(\'' + esc(r.name) + '\')">' +
+            '<span style="opacity:.5">📄</span>' +
+            '<div style="flex:1;min-width:0">' +
+            '<div>' + hl(r.name, q) + '</div>' +
+            (r.snippet ? '<div style="font-size:11px;color:#999;margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(r.snippet) + '</div>' : '') +
+            '</div>' +
+        '</div>';
+    }
+    list.innerHTML = html;
+}
+
+function hl(text, q) {
+    var s = esc(text);
+    var re = new RegExp('(' + q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + ')', 'gi');
+    return s.replace(re, '<mark style="background:#fff3b0;padding:0 2px">$1</mark>');
+}
+
 initEditor();
 loadFileList();
 </script>
@@ -300,6 +347,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._list_files()
         elif path == '/api/file':
             self._get_file(parsed.query)
+        elif path == '/api/search':
+            self._search_files(parsed.query)
         else:
             self._serve_static(path)
 
@@ -332,6 +381,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return None
         return resolved
 
+    def _read_cached(self, filepath):
+        name = filepath.name
+        mtime = filepath.stat().st_mtime
+        if name in _CONTENT_CACHE:
+            cmtime, content = _CONTENT_CACHE[name]
+            if cmtime == mtime:
+                return content
+        content = filepath.read_text(encoding='utf-8', errors='ignore')
+        _CONTENT_CACHE[name] = (mtime, content)
+        return content
+
     def _serve_html(self):
         data = HTML.encode('utf-8')
         self.send_response(200)
@@ -352,6 +412,45 @@ class Handler(http.server.BaseHTTPRequestHandler):
         files.sort(key=lambda f: f['name'].lower())
         self._json(files)
 
+    def _search_files(self, query_string):
+        params = parse_qs(query_string)
+        q = params.get('q', [''])[0].strip()
+        if not q:
+            return self._json([])
+
+        results = []
+        q_lower = q.lower()
+        seen = set()
+
+        for p in BASE_DIR.iterdir():
+            if not p.is_file() or p.suffix.lower() != '.md':
+                continue
+            try:
+                content = self._read_cached(p)
+                idx = content.lower().find(q_lower)
+                if idx >= 0:
+                    start = max(0, idx - 40)
+                    end = min(len(content), idx + len(q) + 40)
+                    snip = content[start:end].replace('\n', ' ')
+                    if start > 0:
+                        snip = '...' + snip
+                    if end < len(content):
+                        snip = snip + '...'
+                    results.append({'name': p.name, 'snippet': snip})
+                    seen.add(p.name)
+            except Exception:
+                pass
+
+        # also match by filename
+        for p in BASE_DIR.iterdir():
+            if not p.is_file() or p.suffix.lower() != '.md':
+                continue
+            if q_lower in p.name.lower() and p.name not in seen:
+                results.append({'name': p.name, 'snippet': ''})
+
+        results.sort(key=lambda r: r['name'].lower())
+        self._json(results)
+
     def _get_file(self, query_string):
         params = parse_qs(query_string)
         name = params.get('name', [None])[0]
@@ -371,7 +470,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if filepath.suffix.lower() != '.md':
             return self._json({'error': 'Not a markdown file'}, 400)
 
-        content = filepath.read_text(encoding='utf-8', errors='ignore')
+        content = self._read_cached(filepath)
         self._json({'name': name, 'content': content})
 
     def _save_file(self, body):
@@ -391,6 +490,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         filepath = BASE_DIR / name
         filepath.write_text(content, encoding='utf-8')
+        _CONTENT_CACHE[name] = (filepath.stat().st_mtime, content)
         self._json({'ok': True, 'name': name})
 
     def _delete_file(self, query_string):
@@ -413,6 +513,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._json({'error': 'Not a markdown file'}, 400)
 
         filepath.unlink()
+        _CONTENT_CACHE.pop(name, None)
         self._json({'ok': True})
 
     def _upload_image(self, body):

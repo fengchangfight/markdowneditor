@@ -61,7 +61,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;d
 #sidebar-header .hdr-actions button{flex:1;padding:5px;font-size:11px;background:#4a90d9;color:#fff;border:none;border-radius:4px;cursor:pointer}
 #sidebar-header .hdr-actions button:hover{background:#357abd}
 #tree-container{flex:1;overflow-y:auto;padding:4px 0}
-.tree-dir{padding:5px 8px;cursor:pointer;display:flex;align-items:center;gap:2px;font-size:13px;color:#555;user-select:none}
+.tree-dir{padding:5px 8px 5px 8px;cursor:pointer;display:flex;align-items:center;gap:2px;font-size:13px;color:#555;user-select:none}
 .tree-dir:hover{background:#eef1f5}
 .tree-dir .arrow{font-size:9px;width:10px;text-align:center;display:inline-block;transition:transform .15s}
 .tree-dir.open>.arrow{transform:rotate(90deg)}
@@ -72,7 +72,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;d
 .tree-dir .dact button:hover{color:#333}
 .tree-dir.drag-over{background:#d4e6f9;outline:2px dashed #4a90d9}
 .file-item.drag-over{background:#d4e6f9}
-.file-item{padding:5px 8px 5px 30px;cursor:pointer;font-size:13px;color:#555;border-left:3px solid transparent;display:flex;align-items:center;gap:4px}
+.file-item{padding:5px 12px 5px 30px;cursor:pointer;font-size:13px;color:#555;border-left:3px solid transparent;display:flex;align-items:center;gap:4px}
 .file-item:hover{background:#eef1f5}
 .file-item.active{background:#e3edf7;border-left-color:#4a90d9;color:#222;font-weight:500}
 .file-item .fname{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -82,9 +82,9 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;d
 .file-item .ren-btn{visibility:hidden;background:none;border:none;color:#888;cursor:pointer;font-size:14px;padding:0 4px}
 .file-item:hover .ren-btn{visibility:visible}
 .file-item .ren-btn:hover{color:#333}
-.file-item .mvu,.file-item .mvd{visibility:hidden;background:none;border:none;color:#aaa;cursor:pointer;font-size:12px;padding:0 2px}
-.file-item:hover .mvu,.file-item:hover .mvd{visibility:visible}
-.file-item .mvu:hover,.file-item .mvd:hover{color:#333}
+.file-item .mvu,.file-item .mvd,.file-item .mup{visibility:hidden;background:none;border:none;color:#aaa;cursor:pointer;font-size:12px;padding:0 2px}
+.file-item:hover .mvu,.file-item:hover .mvd,.file-item:hover .mup{visibility:visible}
+.file-item .mvu:hover,.file-item .mvd:hover,.file-item .mup:hover{color:#333}
 #main{flex:1;display:flex;flex-direction:column;overflow:hidden}
 #toolbar{padding:8px 14px;border-bottom:1px solid #e0e0e0;background:#fff;display:flex;align-items:center;gap:10px;flex-shrink:0}
 #toolbar #current-file{font-size:14px;color:#333;font-weight:500}
@@ -102,6 +102,11 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;d
 #editor-container.prv-only .toastui-editor-md-editor{display:none!important}
 #search-box{width:100%;padding:6px 8px;border:1px solid #ddd;border-radius:4px;font-size:13px;outline:none;margin-bottom:6px}
 #search-box:focus{border-color:#4a90d9}
+#resize-handle{width:8px;cursor:col-resize;flex-shrink:0;position:relative;z-index:1}
+#resize-handle::after{content:'';position:absolute;left:3px;top:0;bottom:0;width:2px;background:transparent;transition:background .15s}
+#resize-handle:hover::after,#resize-handle.active::after{background:#4a90d9}
+body.resizing{cursor:col-resize;user-select:none}
+body.resizing iframe{pointer-events:none}
 </style>
 </head>
 <body>
@@ -115,10 +120,12 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;d
     <div class="hdr-actions">
       <button onclick="createFile('')">+ File</button>
       <button onclick="createDir('')">+ Dir</button>
+      <button onclick="downloadZip('')" title="Download all as ZIP">⬇ ZIP</button>
     </div>
   </div>
   <div id="tree-container"></div>
 </div>
+<div id="resize-handle"></div>
 <div id="main">
   <div id="toolbar">
     <span id="current-file">No file selected</span>
@@ -213,17 +220,20 @@ function buildTreeHTML(nodes, depth) {
     for (var i = 0; i < nodes.length; i++) {
         var n = nodes[i];
         var parent = n.path.substring(0, n.path.lastIndexOf('/'));
+        var moveUpBtn = parent !== '' ? '<button class="mup" title="Move to parent" onclick="event.stopPropagation();moveUpItem(\'' + esc(n.path) + '\')">↩</button>' : '';
         if (n.type === 'dir') {
             html += '<div class="tree-dir" data-path="' + esc(n.path) + '" style="padding-left:' + (8 + depth * 14) + 'px" onclick="toggleDir(this)" draggable="true" ondragstart="dragStart(event,\'dir\',\'' + esc(n.path) + '\')" ondragend="dragEnd(event)" ondragover="dragOver(event)" ondragleave="dragLeave(event)" ondrop="dropOnDir(event,\'' + esc(n.path) + '\')">';
             html += '<span class="arrow">▶</span>';
             html += '<span class="dname">📁 ' + esc(n.name) + '</span>';
             html += '<span class="dact">';
+            html += '<button title="Delete" onclick="event.stopPropagation();deleteDir(\'' + esc(n.path) + '\')">×</button>';
             html += '<button title="Move up" onclick="event.stopPropagation();reorderItem(\'' + esc(parent) + '\',\'' + esc(n.name) + '\',\'up\')">▲</button>';
             html += '<button title="Move down" onclick="event.stopPropagation();reorderItem(\'' + esc(parent) + '\',\'' + esc(n.name) + '\',\'down\')">▼</button>';
+            html += moveUpBtn;
             html += '<button title="Rename" onclick="event.stopPropagation();startRename(this,\'dir\',\'' + esc(n.path) + '\')">✏</button>';
             html += '<button title="New File" onclick="event.stopPropagation();createFile(\'' + esc(n.path) + '\')">+📄</button>';
             html += '<button title="New Dir" onclick="event.stopPropagation();createDir(\'' + esc(n.path) + '\')">+📁</button>';
-            html += '<button title="Delete" onclick="event.stopPropagation();deleteDir(\'' + esc(n.path) + '\')">×</button>';
+            html += '<button title="Download as ZIP" onclick="event.stopPropagation();downloadZip(\'' + esc(n.path) + '\')">⬇</button>';
             html += '</span></div>';
             html += '<div class="tree-children" style="display:none">';
             html += buildTreeHTML(n.children, depth + 1);
@@ -231,11 +241,12 @@ function buildTreeHTML(nodes, depth) {
         } else {
             var cls = (currentFile === n.path) ? ' file-item active' : ' file-item';
             html += '<div class="' + cls + '" style="padding-left:' + (26 + depth * 14) + 'px" onclick="openFile(\'' + esc(n.path) + '\')" draggable="true" ondragstart="dragStart(event,\'file\',\'' + esc(n.path) + '\')" ondragend="dragEnd(event)">';
-            html += '📄 <span class="fname">' + esc(n.name) + '</span>';
+            html += '📄 <button class="del-btn" onclick="event.stopPropagation();delFile(\'' + esc(n.path) + '\')">×</button>';
+            html += '<span class="fname">' + esc(n.name) + '</span>';
             html += '<button class="mvu" title="Move up" onclick="event.stopPropagation();reorderItem(\'' + esc(parent) + '\',\'' + esc(n.name) + '\',\'up\')">▲</button>';
             html += '<button class="mvd" title="Move down" onclick="event.stopPropagation();reorderItem(\'' + esc(parent) + '\',\'' + esc(n.name) + '\',\'down\')">▼</button>';
+            html += moveUpBtn;
             html += '<button class="ren-btn" onclick="event.stopPropagation();startRename(this,\'file\',\'' + esc(n.path) + '\')">✏</button>';
-            html += '<button class="del-btn" onclick="event.stopPropagation();delFile(\'' + esc(n.path) + '\')">×</button>';
             html += '</div>';
         }
     }
@@ -570,6 +581,30 @@ function reorderItem(parent, name, dir) {
     });
 }
 
+function moveUpItem(fullPath) {
+    var parent = fullPath.substring(0, fullPath.lastIndexOf('/'));
+    var grandparent = parent.substring(0, parent.lastIndexOf('/'));
+    fetch('/api/move', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({from: fullPath, to: grandparent})
+    }).then(function(r){ return r.json() }).then(function(d){
+        if (d.ok) {
+            if (currentFile === fullPath) { currentFile = d.to; document.getElementById('current-file').textContent = currentFile; }
+            loadTree();
+        } else { alert(d.error); }
+    });
+}
+
+function downloadZip(dirPath) {
+    var a = document.createElement('a');
+    a.href = '/api/zip?path=' + encodeURIComponent(dirPath);
+    a.download = '';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+}
+
 document.addEventListener('keydown', function(e) {
     if ((e.ctrlKey || e.metaKey) && e.key === 's') {
         e.preventDefault();
@@ -620,6 +655,31 @@ function hl(text, q) {
 
 initEditor();
 loadTree();
+
+var resizeHandle = document.getElementById('resize-handle');
+var sidebarEl = document.getElementById('sidebar');
+var startX, startW;
+resizeHandle.addEventListener('mousedown', function(e) {
+    startX = e.clientX;
+    startW = sidebarEl.offsetWidth;
+    document.body.classList.add('resizing');
+    resizeHandle.classList.add('active');
+    document.addEventListener('mousemove', onResize);
+    document.addEventListener('mouseup', stopResize);
+});
+function onResize(e) {
+    var w = startW + (e.clientX - startX);
+    if (w < 180) w = 180;
+    if (w > 600) w = 600;
+    sidebarEl.style.width = w + 'px';
+    sidebarEl.style.minWidth = w + 'px';
+}
+function stopResize() {
+    document.body.classList.remove('resizing');
+    resizeHandle.classList.remove('active');
+    document.removeEventListener('mousemove', onResize);
+    document.removeEventListener('mouseup', stopResize);
+}
 </script>
 </body>
 </html>"""
@@ -695,6 +755,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._get_file(parsed.query)
         elif path == "/api/search":
             self._search_files(parsed.query)
+        elif path == "/api/zip":
+            self._zip_dir(parsed.query)
         else:
             self._serve_static(path)
 
@@ -1127,6 +1189,44 @@ class Handler(http.server.BaseHTTPRequestHandler):
         shutil.rmtree(str(dirpath))
         self._mark_index_dirty()
         self._json({"ok": True})
+
+    def _zip_dir(self, query_string):
+        params = parse_qs(query_string)
+        dirpath_str = params.get("path", [""])[0]
+        if dirpath_str:
+            dirpath = self._safe_resolve(dirpath_str)
+        else:
+            dirpath = BASE_DIR
+        if not dirpath or not dirpath.exists() or not dirpath.is_dir():
+            return self._json({"error": "Directory not found"}, 404)
+
+        import io
+        import zipfile
+
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            base = dirpath
+            for p in base.rglob("*"):
+                if not p.is_file():
+                    continue
+                ext = p.suffix.lower()
+                if ext != ".md" and ext not in IMAGE_EXTS:
+                    continue
+                arcname = str(p.relative_to(base)).replace("\\", "/")
+                zf.write(str(p), arcname)
+
+        zip_data = buf.getvalue()
+        zip_name = (dirpath.name or "root") + ".zip"
+
+        self.send_response(200)
+        self.send_header("Content-Type", "application/zip")
+        self.send_header(
+            "Content-Disposition",
+            f'attachment; filename="{zip_name}"',
+        )
+        self.send_header("Content-Length", len(zip_data))
+        self.end_headers()
+        self.wfile.write(zip_data)
 
     def _move(self, body):
         try:

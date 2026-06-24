@@ -10,6 +10,7 @@ import json
 import mimetypes
 import os
 import re
+import shutil
 import sys
 import time
 import uuid
@@ -23,8 +24,14 @@ BASE_DIR = Path(__file__).parent.resolve()
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp", ".ico"}
 TEXT_EXTS = {".css", ".js", ".md", ".html", ".txt", ".json", ".xml", ".csv"}
 
-# In-memory content cache: filename -> (mtime, content)
+# In-memory content cache: relpath -> (mtime, content)
 _CONTENT_CACHE = {}
+
+# Search index
+_INDEX = None  # {word: set(path)}
+_INDEX_MTIMES = {}  # {path: mtime}
+_INDEX_DIRTY = True
+_INDEX_FILE = BASE_DIR / ".mdeditor_index.json"
 
 # Auth
 USERNAME = os.environ.get("MDEDITOR_USER", "fengchang")
@@ -43,19 +50,34 @@ HTML = r"""<!DOCTYPE html>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;display:flex;height:100vh;overflow:hidden}
-#sidebar{width:250px;min-width:250px;background:#f7f8fa;border-right:1px solid #e0e0e0;display:flex;flex-direction:column}
-#sidebar-header{padding:14px;border-bottom:1px solid #e0e0e0}
-#sidebar-header h2{font-size:15px;margin-bottom:10px;color:#333}
-#sidebar-header button{width:100%;padding:7px;background:#4a90d9;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:13px}
-#sidebar-header button:hover{background:#357abd}
-#file-list{flex:1;overflow-y:auto;padding:6px 0}
-.file-item{padding:9px 14px;cursor:pointer;font-size:13px;color:#555;border-left:3px solid transparent;transition:all .15s;display:flex;align-items:center;gap:6px}
+#sidebar{width:260px;min-width:260px;background:#f7f8fa;border-right:1px solid #e0e0e0;display:flex;flex-direction:column}
+#sidebar-header{padding:12px;border-bottom:1px solid #e0e0e0}
+#sidebar-header h2{font-size:15px;margin-bottom:8px;color:#333}
+#sidebar-header .hdr-actions{display:flex;gap:4px;margin-top:6px}
+#sidebar-header .hdr-actions button{flex:1;padding:5px;font-size:11px;background:#4a90d9;color:#fff;border:none;border-radius:4px;cursor:pointer}
+#sidebar-header .hdr-actions button:hover{background:#357abd}
+#tree-container{flex:1;overflow-y:auto;padding:4px 0}
+.tree-dir{padding:5px 8px;cursor:pointer;display:flex;align-items:center;gap:2px;font-size:13px;color:#555;user-select:none}
+.tree-dir:hover{background:#eef1f5}
+.tree-dir .arrow{font-size:9px;width:10px;text-align:center;display:inline-block;transition:transform .15s}
+.tree-dir.open>.arrow{transform:rotate(90deg)}
+.tree-dir .dname{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tree-dir .dact{display:none;gap:1px;margin-left:2px}
+.tree-dir:hover>.dact{display:flex}
+.tree-dir .dact button{background:none;border:none;cursor:pointer;font-size:10px;padding:0 3px;color:#aaa}
+.tree-dir .dact button:hover{color:#333}
+.tree-dir.drag-over{background:#d4e6f9;outline:2px dashed #4a90d9}
+.file-item.drag-over{background:#d4e6f9}
+.file-item{padding:5px 8px 5px 30px;cursor:pointer;font-size:13px;color:#555;border-left:3px solid transparent;display:flex;align-items:center;gap:4px}
 .file-item:hover{background:#eef1f5}
 .file-item.active{background:#e3edf7;border-left-color:#4a90d9;color:#222;font-weight:500}
-.file-item .name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.file-item .fname{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .file-item .del-btn{visibility:hidden;background:none;border:none;color:#c0392b;cursor:pointer;font-size:14px;padding:0 4px}
 .file-item:hover .del-btn{visibility:visible}
 .file-item .del-btn:hover{color:#e74c3c}
+.file-item .ren-btn{visibility:hidden;background:none;border:none;color:#888;cursor:pointer;font-size:14px;padding:0 4px}
+.file-item:hover .ren-btn{visibility:visible}
+.file-item .ren-btn:hover{color:#333}
 #main{flex:1;display:flex;flex-direction:column;overflow:hidden}
 #toolbar{padding:8px 14px;border-bottom:1px solid #e0e0e0;background:#fff;display:flex;align-items:center;gap:10px;flex-shrink:0}
 #toolbar #current-file{font-size:14px;color:#333;font-weight:500}
@@ -71,18 +93,21 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;d
 .toastui-editor-defaultUI{border:none!important;border-radius:0!important}
 #editor-container.src-only .toastui-editor-md-preview{display:none!important}
 #editor-container.prv-only .toastui-editor-md-editor{display:none!important}
-#search-box{width:100%;padding:6px 8px;border:1px solid #ddd;border-radius:4px;font-size:13px;outline:none;margin-bottom:8px}
+#search-box{width:100%;padding:6px 8px;border:1px solid #ddd;border-radius:4px;font-size:13px;outline:none;margin-bottom:6px}
 #search-box:focus{border-color:#4a90d9}
 </style>
 </head>
 <body>
 <div id="sidebar">
   <div id="sidebar-header">
-    <h2>📝 Markdown Files</h2>
-    <input id="search-box" type="text" placeholder="Search title / content..." oninput="onSearch()">
-    <button onclick="createFile()">+ New File</button>
+    <h2>📝 Files</h2>
+    <input id="search-box" type="text" placeholder="Search..." oninput="onSearch()">
+    <div class="hdr-actions">
+      <button onclick="createFile('')">+ File</button>
+      <button onclick="createDir('')">+ Dir</button>
+    </div>
   </div>
-  <div id="file-list"></div>
+  <div id="tree-container"></div>
 </div>
 <div id="main">
   <div id="toolbar">
@@ -106,10 +131,11 @@ var csPlugin = (window.toastui && window.toastui.Editor && window.toastui.Editor
 
 var editor = null;
 var currentFile = null;
-var allFiles = [];
+var allTreeData = [];
 var isWysiwyg = false;
 var viewMode = 'split';
 var autoSaveTimer = null;
+var savedViewMode = 'split';
 
 function initEditor() {
     var plugins = csPlugin ? [csPlugin] : [];
@@ -123,10 +149,11 @@ function initEditor() {
             addImageBlobHook: function(blob, callback) {
                 var reader = new FileReader();
                 reader.onload = function(e) {
+                    var dir = currentFile ? currentFile.substring(0, currentFile.lastIndexOf('/') + 1) : '';
                     fetch('/api/upload', {
                         method: 'POST',
                         headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({data: e.target.result})
+                        body: JSON.stringify({data: e.target.result, dir: dir})
                     }).then(function(r){ return r.json() }).then(function(d){
                         callback(d.url, blob.name || 'image');
                     }).catch(function(err){
@@ -140,117 +167,190 @@ function initEditor() {
     editor.on('change', onEditorChange);
 }
 
-function loadFileList() {
-    fetch('/api/files').then(function(r){return r.json()}).then(function(files){
-        allFiles = files;
-        renderFileList();
+function loadTree() {
+    fetch('/api/tree').then(function(r){return r.json()}).then(function(tree){
+        allTreeData = tree;
+        renderTreeView();
     });
 }
 
-function renderFileList() {
-    var list = document.getElementById('file-list');
-    var html = '';
-    for (var i = 0; i < allFiles.length; i++) {
-        var f = allFiles[i];
-        var cls = currentFile === f.name ? ' active' : '';
-        html += '<div class="file-item' + cls + '" onclick="openFile(\'' + esc(f.name) + '\')">' +
-            '<span style="opacity:.5">📄</span>' +
-            '<span class="name">' + esc(f.name) + '</span>' +
-            '<button class="del-btn" onclick="event.stopPropagation();delFile(\'' + esc(f.name) + '\')" title="Delete">×</button>' +
-        '</div>';
+function renderTreeView() {
+    var expanded = [];
+    var dirs = document.querySelectorAll('.tree-dir.open');
+    for (var i = 0; i < dirs.length; i++) {
+        expanded.push(dirs[i].getAttribute('data-path'));
     }
-    list.innerHTML = html;
+    document.getElementById('tree-container').innerHTML = buildTreeHTML(allTreeData);
+    if (expanded.length > 0) {
+        dirs = document.querySelectorAll('.tree-dir');
+        for (var i = 0; i < dirs.length; i++) {
+            if (expanded.indexOf(dirs[i].getAttribute('data-path')) >= 0) {
+                dirs[i].classList.add('open');
+                var c = dirs[i].nextElementSibling;
+                if (c && c.classList.contains('tree-children')) {
+                    c.style.display = 'block';
+                }
+            }
+        }
+    }
+}
+
+function buildTreeHTML(nodes, depth) {
+    if (!depth) depth = 0;
+    var html = '';
+    for (var i = 0; i < nodes.length; i++) {
+        var n = nodes[i];
+        if (n.type === 'dir') {
+            html += '<div class="tree-dir" data-path="' + esc(n.path) + '" style="padding-left:' + (8 + depth * 14) + 'px" onclick="toggleDir(this)" draggable="true" ondragstart="dragStart(event,\'dir\',\'' + esc(n.path) + '\')" ondragend="dragEnd(event)" ondragover="dragOver(event)" ondragleave="dragLeave(event)" ondrop="dropOnDir(event,\'' + esc(n.path) + '\')">';
+            html += '<span class="arrow">▶</span>';
+            html += '<span class="dname">📁 ' + esc(n.name) + '</span>';
+            html += '<span class="dact">';
+            html += '<button title="Rename" onclick="event.stopPropagation();startRename(this,\'dir\',\'' + esc(n.path) + '\')">✏</button>';
+            html += '<button title="New File" onclick="event.stopPropagation();createFile(\'' + esc(n.path) + '\')">+📄</button>';
+            html += '<button title="New Dir" onclick="event.stopPropagation();createDir(\'' + esc(n.path) + '\')">+📁</button>';
+            html += '<button title="Delete" onclick="event.stopPropagation();deleteDir(\'' + esc(n.path) + '\')">×</button>';
+            html += '</span></div>';
+            html += '<div class="tree-children" style="display:none">';
+            html += buildTreeHTML(n.children, depth + 1);
+            html += '</div>';
+        } else {
+            var cls = (currentFile === n.path) ? ' file-item active' : ' file-item';
+            html += '<div class="' + cls + '" style="padding-left:' + (26 + depth * 14) + 'px" onclick="openFile(\'' + esc(n.path) + '\')" draggable="true" ondragstart="dragStart(event,\'file\',\'' + esc(n.path) + '\')" ondragend="dragEnd(event)">';
+            html += '📄 <span class="fname">' + esc(n.name) + '</span>';
+            html += '<button class="ren-btn" onclick="event.stopPropagation();startRename(this,\'file\',\'' + esc(n.path) + '\')">✏</button>';
+            html += '<button class="del-btn" onclick="event.stopPropagation();delFile(\'' + esc(n.path) + '\')">×</button>';
+            html += '</div>';
+        }
+    }
+    return html;
+}
+
+function toggleDir(el) {
+    el.classList.toggle('open');
+    var c = el.nextElementSibling;
+    if (c && c.classList.contains('tree-children')) {
+        c.style.display = c.style.display === 'none' ? 'block' : 'none';
+    }
 }
 
 function esc(s) {
     return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
 }
 
-function openFile(name) {
+function openFile(path) {
     clearTimeout(autoSaveTimer);
-    fetch('/api/file?name=' + encodeURIComponent(name)).then(function(r){
+    fetch('/api/file?path=' + encodeURIComponent(path)).then(function(r){
         if (!r.ok) throw new Error('not found');
         return r.json();
     }).then(function(data){
-        currentFile = data.name;
+        currentFile = data.path;
         editor.setMarkdown(data.content);
         document.getElementById('current-file').textContent = currentFile;
         document.getElementById('save-status').textContent = '';
         document.getElementById('del-btn').style.display = '';
-        renderFileList();
+        renderTreeView();
     }).catch(function(){
-        alert('Failed to open file: ' + name);
+        alert('Failed to open: ' + path);
     });
 }
 
 function saveCurrentFile() {
     if (!currentFile) { alert('No file selected'); return; }
     clearTimeout(autoSaveTimer);
-    var content = editor.getMarkdown();
+    doSave(currentFile, editor.getMarkdown(), true);
+}
+
+function doSave(path, content, showAlert) {
+    var st = document.getElementById('save-status');
     fetch('/api/file', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({name: currentFile, content: content})
-    }).then(function(r){
-        return r.json();
-    }).then(function(){
-        var st = document.getElementById('save-status');
-        st.textContent = '✓ Saved';
-        st.style.color = '#27ae60';
-        setTimeout(function(){ st.textContent = ''; }, 2000);
+        body: JSON.stringify({path: path, content: content})
+    }).then(function(r){ return r.json() }).then(function(){
+        if (showAlert) {
+            st.textContent = '✓ Saved';
+            st.style.color = '#27ae60';
+            setTimeout(function(){ st.textContent = ''; }, 2000);
+        } else {
+            st.textContent = '✓';
+            st.style.color = '#27ae60';
+            setTimeout(function(){ st.textContent = ''; }, 1500);
+        }
     }).catch(function(){
-        alert('Failed to save');
+        if (showAlert) alert('Failed to save');
+        else { st.textContent = '✗'; st.style.color = '#e74c3c'; }
     });
 }
 
 function deleteCurrentFile() {
     if (!currentFile) return;
-    if (!confirm('Delete "' + currentFile + '"?')) return;
-    fetch('/api/file?name=' + encodeURIComponent(currentFile), { method: 'DELETE' }).then(function(r){
-        if (r.ok) {
-            currentFile = null;
-            editor.setMarkdown('');
-            document.getElementById('current-file').textContent = 'No file selected';
-            document.getElementById('del-btn').style.display = 'none';
-            loadFileList();
-        }
-    });
+    delFile(currentFile);
 }
 
-function delFile(name) {
-    if (!confirm('Delete "' + name + '"?')) return;
-    fetch('/api/file?name=' + encodeURIComponent(name), { method: 'DELETE' }).then(function(r){
+function delFile(path) {
+    if (!confirm('Delete "' + path + '"?')) return;
+    fetch('/api/file?path=' + encodeURIComponent(path), { method: 'DELETE' }).then(function(r){
         if (r.ok) {
-            if (currentFile === name) {
+            if (currentFile === path) {
                 currentFile = null;
                 editor.setMarkdown('');
                 document.getElementById('current-file').textContent = 'No file selected';
                 document.getElementById('del-btn').style.display = 'none';
             }
-            loadFileList();
+            loadTree();
+        } else {
+            r.json().then(function(d){ alert(d.error); });
         }
     });
 }
 
-function createFile() {
+function createFile(parentPath) {
     var name = prompt('Enter filename:', 'new-note.md');
     if (!name) return;
     if (!/\.md$/i.test(name)) name += '.md';
+    var fullPath = parentPath ? parentPath + '/' + name : name;
     var title = name.replace(/\.md$/i, '');
     var content = '# ' + title + '\n\n';
     fetch('/api/file', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({name: name, content: content})
+        body: JSON.stringify({path: fullPath, content: content})
     }).then(function(r){
-        if (r.ok) { loadFileList(); openFile(name); }
-        else {
-            return r.json().then(function(d){ alert(d.error || 'Failed to create'); });
-        }
+        if (r.ok) { loadTree(); openFile(fullPath); }
+        else { r.json().then(function(d){ alert(d.error); }); }
     });
 }
 
-var savedViewMode = 'split';
+function createDir(parentPath) {
+    var name = prompt('Enter directory name:');
+    if (!name) return;
+    var fullPath = parentPath ? parentPath + '/' + name : name;
+    fetch('/api/dir', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({path: fullPath})
+    }).then(function(r){
+        if (r.ok) { loadTree(); }
+        else { r.json().then(function(d){ alert(d.error); }); }
+    });
+}
+
+function deleteDir(path) {
+    if (!confirm('Delete directory "' + path + '" and ALL its contents?')) return;
+    fetch('/api/dir?path=' + encodeURIComponent(path), { method: 'DELETE' }).then(function(r){
+        if (r.ok) {
+            if (currentFile && currentFile.indexOf(path + '/') === 0) {
+                currentFile = null;
+                editor.setMarkdown('');
+                document.getElementById('current-file').textContent = 'No file selected';
+                document.getElementById('del-btn').style.display = 'none';
+            }
+            loadTree();
+        } else {
+            r.json().then(function(d){ alert(d.error); });
+        }
+    });
+}
 
 function toggleMode() {
     if (!editor) return;
@@ -302,25 +402,117 @@ function onEditorChange() {
 
 function autoSave() {
     if (!currentFile) return;
-    var content = editor.getMarkdown();
-    var st = document.getElementById('save-status');
-    fetch('/api/file', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({name: currentFile, content: content})
-    }).then(function(r){ return r.json() }).then(function(){
-        st.textContent = '✓';
-        st.style.color = '#27ae60';
-        setTimeout(function(){ st.textContent = ''; }, 1500);
-    }).catch(function(){
-        st.textContent = '✗';
-        st.style.color = '#e74c3c';
-    });
+    doSave(currentFile, editor.getMarkdown(), false);
 }
 
 function logout() {
     fetch('/api/logout', { method: 'POST' }).then(function(){
         location.href = '/';
+    });
+}
+
+var dragInfo = null;
+
+function dragStart(e, type, path) {
+    dragInfo = {type: type, path: path};
+    e.dataTransfer.effectAllowed = 'move';
+    e.dataTransfer.setData('text/plain', path);
+    e.currentTarget.style.opacity = '0.4';
+}
+
+function dragEnd(e) {
+    e.currentTarget.style.opacity = '1';
+    var all = document.querySelectorAll('.drag-over');
+    for (var i = 0; i < all.length; i++) all[i].classList.remove('drag-over');
+    dragInfo = null;
+}
+
+function dragOver(e) {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+    e.currentTarget.classList.add('drag-over');
+}
+
+function dragLeave(e) {
+    e.currentTarget.classList.remove('drag-over');
+}
+
+function dropOnDir(e, targetDir) {
+    e.preventDefault();
+    e.currentTarget.classList.remove('drag-over');
+    if (!dragInfo) return;
+    if (dragInfo.path === targetDir) return;
+    if (dragInfo.type === 'dir' && (dragInfo.path === targetDir || targetDir.indexOf(dragInfo.path + '/') === 0)) return;
+    fetch('/api/move', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({from: dragInfo.path, to: targetDir})
+    }).then(function(r){ return r.json() }).then(function(d){
+        if (d.ok) {
+            if (currentFile && currentFile === dragInfo.path) {
+                currentFile = d.to;
+                document.getElementById('current-file').textContent = currentFile;
+            }
+            loadTree();
+        } else { alert(d.error); }
+    });
+    dragInfo = null;
+}
+
+function startRename(btn, type, path) {
+    var item = btn.parentElement;
+    while (item && !item.classList.contains('tree-dir') && !item.classList.contains('file-item')) {
+        item = item.parentElement;
+    }
+    if (!item) return;
+    var nameSpan = item.querySelector('.dname') || item.querySelector('.fname');
+    if (!nameSpan) return;
+    var oldName = path.split('/').pop();
+    var input = document.createElement('input');
+    input.type = 'text';
+    input.value = type === 'file' ? oldName.replace(/\.md$/i, '') : oldName;
+    input.style.cssText = 'width:100%;border:1px solid #4a90d9;outline:none;font-size:13px;padding:1px 4px;border-radius:2px;background:#fff';
+    nameSpan.style.display = 'none';
+    nameSpan.parentNode.insertBefore(input, nameSpan);
+    input.focus();
+    input.select();
+    var done = false;
+    function finish() {
+        if (done) return;
+        done = true;
+        nameSpan.style.display = '';
+        input.remove();
+    }
+    function submit() {
+        var newName = input.value.trim();
+        if (!newName || newName === (type === 'file' ? oldName.replace(/\.md$/i, '') : oldName)) {
+            finish();
+            return;
+        }
+        if (type === 'file' && !/\.md$/i.test(newName)) newName += '.md';
+        finish();
+        doRename(path, newName);
+    }
+    input.addEventListener('blur', function() { setTimeout(finish, 100); });
+    input.addEventListener('keydown', function(e) {
+        if (e.key === 'Enter') { e.preventDefault(); submit(); }
+        else if (e.key === 'Escape') { finish(); }
+    });
+}
+
+function doRename(oldPath, newName) {
+    fetch('/api/rename', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({from: oldPath, name: newName})
+    }).then(function(r){ return r.json() }).then(function(d){
+        if (d.ok) {
+            if (currentFile === oldPath) {
+                currentFile = d.to;
+                document.getElementById('current-file').textContent = currentFile;
+            }
+            loadTree();
+        } else { alert(d.error); }
     });
 }
 
@@ -340,30 +532,30 @@ function onSearch() {
 
 function doSearch() {
     var q = document.getElementById('search-box').value.trim();
-    if (!q) { loadFileList(); return; }
+    if (!q) { renderTreeView(); return; }
     fetch('/api/search?q=' + encodeURIComponent(q)).then(function(r){return r.json()}).then(function(r){
         renderSearchResults(r, q);
     });
 }
 
 function renderSearchResults(results, q) {
-    var list = document.getElementById('file-list');
+    var el = document.getElementById('tree-container');
     if (results.length === 0) {
-        list.innerHTML = '<div style="padding:12px;color:#999;font-size:13px">No results</div>';
+        el.innerHTML = '<div style="padding:12px;color:#999;font-size:13px">No results</div>';
         return;
     }
     var html = '';
     for (var i = 0; i < results.length; i++) {
         var r = results[i];
-        html += '<div class="file-item" onclick="openFile(\'' + esc(r.name) + '\')">' +
+        html += '<div class="file-item" style="padding:5px 8px 5px 12px" onclick="openFile(\'' + esc(r.path) + '\')">' +
             '<span style="opacity:.5">📄</span>' +
             '<div style="flex:1;min-width:0">' +
-            '<div>' + hl(r.name, q) + '</div>' +
+            '<div style="font-size:13px">' + hl(r.path, q) + '</div>' +
             (r.snippet ? '<div style="font-size:11px;color:#999;margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(r.snippet) + '</div>' : '') +
             '</div>' +
         '</div>';
     }
-    list.innerHTML = html;
+    el.innerHTML = html;
 }
 
 function hl(text, q) {
@@ -373,7 +565,7 @@ function hl(text, q) {
 }
 
 initEditor();
-loadFileList();
+loadTree();
 </script>
 </body>
 </html>"""
@@ -426,7 +618,7 @@ function login(e) {
 
 # Favicon data URI (hardcoded base64)
 _FAVICON_DATA_URI = 'data:image/x-icon;base64,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'
-
+_FAVICON_DATA_URI = "data:image/x-icon;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAAXNSR0IArs4c6QAAAVlJREFUWEftljFKBEEQRf+rgRcQBBEMDAwEEW/AyAsIgpGxoIGRJ5hLeAQjA+MJDPQGYiAiiJggGPgDQU0ErSaDZJbqbff0TI9Id0HTPV39XnV1dVcye96DWnQBSnZR4PAD/T/5jR94AZ4s5OtvC5j5AtgtSu5HAEOYFaTf7wMYc78jiPg5ioBWBVAE9KwL0BUIdQLfni7dLYDpBND7b8b5QwBduklg2oJQBbQ1IcIvQnDH9JlyZROACB1zWj3/coCbjAEMNl0CXHBP4s8qwNkOYMk8Qh8D0nv1DcC5tw8FEYjs9v7Tw78dIQSYkUeB0IXgSjC1WNAAEbYQ7GcYvwwgylr5/sRQ7PkHgNucB0SOsoMA96IePxR/LYBYE8GCCT0Hz6ysX7AxHsCbCbM60odZCF9Bo9d8u54IAOdjqAjjB5oADswF+r8LLBAvIMTHjOGXy8l7AE5KzN8FqzO/AWRG8AnBikFkAAAAAElFTkSuQmCC"
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
@@ -442,6 +634,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._serve_login_page()
         elif not self._check_auth():
             self._json({"error": "Unauthorized"}, 401)
+        elif path == "/api/tree":
+            self._tree()
         elif path == "/api/files":
             self._list_files()
         elif path == "/api/file":
@@ -465,8 +659,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._json({"error": "Unauthorized"}, 401)
         elif path == "/api/file":
             self._save_file(body)
+        elif path == "/api/dir":
+            self._make_dir(body)
         elif path == "/api/upload":
             self._upload_image(body)
+        elif path == "/api/move":
+            self._move(body)
+        elif path == "/api/rename":
+            self._rename(body)
         else:
             self._json({"error": "Not found"}, 404)
 
@@ -477,27 +677,115 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._json({"error": "Unauthorized"}, 401)
         elif path == "/api/file":
             self._delete_file(parsed.query)
+        elif path == "/api/dir":
+            self._remove_dir(parsed.query)
         else:
             self._json({"error": "Not found"}, 404)
 
     def _safe_resolve(self, rel_path):
-        resolved = (BASE_DIR / rel_path).resolve()
-        try:
-            resolved.relative_to(BASE_DIR)
-        except ValueError:
-            return None
+        rel_path = rel_path.replace("\\", "/")
+        parts = [p for p in rel_path.split("/") if p and p != ".."]
+        if not parts:
+            return BASE_DIR
+        resolved = BASE_DIR
+        for part in parts:
+            resolved = (resolved / part).resolve()
+            try:
+                resolved.relative_to(BASE_DIR)
+            except ValueError:
+                return None
         return resolved
 
-    def _read_cached(self, filepath):
-        name = filepath.name
+    def _read_cached(self, filepath, relpath):
         mtime = filepath.stat().st_mtime
-        if name in _CONTENT_CACHE:
-            cmtime, content = _CONTENT_CACHE[name]
+        if relpath in _CONTENT_CACHE:
+            cmtime, content = _CONTENT_CACHE[relpath]
             if cmtime == mtime:
                 return content
         content = filepath.read_text(encoding="utf-8", errors="ignore")
-        _CONTENT_CACHE[name] = (mtime, content)
+        _CONTENT_CACHE[relpath] = (mtime, content)
         return content
+
+    def _mark_index_dirty(self):
+        global _INDEX_DIRTY
+        _INDEX_DIRTY = True
+
+    def _ensure_index(self):
+        global _INDEX, _INDEX_MTIMES, _INDEX_DIRTY
+        if not _INDEX_DIRTY and _INDEX is not None:
+            return
+        if not _INDEX_DIRTY and _INDEX_FILE.exists():
+            try:
+                data = json.loads(_INDEX_FILE.read_text(encoding="utf-8"))
+                _INDEX = {k: set(v) for k, v in data.get("index", {}).items()}
+                _INDEX_MTIMES = data.get("mtimes", {})
+                _INDEX_DIRTY = False
+                return
+            except Exception:
+                pass
+        self._build_index()
+
+    def _build_index(self):
+        global _INDEX, _INDEX_MTIMES, _INDEX_DIRTY
+        _INDEX = {}
+        _INDEX_MTIMES = {}
+        for p in BASE_DIR.rglob("*.md"):
+            rel = str(p.relative_to(BASE_DIR)).replace("\\", "/")
+            try:
+                _INDEX_MTIMES[rel] = p.stat().st_mtime
+                text = (rel + " " + p.read_text(encoding="utf-8", errors="ignore")).lower()
+                words = set(re.findall(r"[\u4e00-\u9fff\w]{2,}", text))
+                for w in words:
+                    _INDEX.setdefault(w, set()).add(rel)
+            except Exception:
+                pass
+        _INDEX_DIRTY = False
+        try:
+            data = {
+                "mtimes": _INDEX_MTIMES,
+                "index": {k: list(v) for k, v in _INDEX.items()},
+            }
+            _INDEX_FILE.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            pass
+
+    def _build_tree(self, base_path=None, rel_prefix=""):
+        if base_path is None:
+            base_path = BASE_DIR
+        result = []
+        try:
+            entries = sorted(
+                base_path.iterdir(),
+                key=lambda p: (not p.is_dir(), p.name.lower()),
+            )
+        except OSError:
+            return result
+
+        for entry in entries:
+            if entry.name.startswith("."):
+                continue
+            rel = (
+                (rel_prefix + "/" + entry.name).lstrip("/")
+                if rel_prefix
+                else entry.name
+            )
+            rel = rel.replace("\\", "/")
+
+            if entry.is_dir():
+                children = self._build_tree(entry, rel)
+                result.append(
+                    {
+                        "name": entry.name,
+                        "path": rel,
+                        "type": "dir",
+                        "children": children,
+                    }
+                )
+            elif entry.suffix.lower() == ".md":
+                result.append(
+                    {"name": entry.name, "path": rel, "type": "file"}
+                )
+        return result
 
     def _check_auth(self):
         cookie = self.headers.get("Cookie", "")
@@ -551,18 +839,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _tree(self):
+        tree = self._build_tree()
+        self._json(tree)
+
     def _list_files(self):
         files = []
-        for p in BASE_DIR.iterdir():
-            if p.is_file() and p.suffix.lower() == ".md":
-                files.append(
-                    {
-                        "name": p.name,
-                        "size": p.stat().st_size,
-                        "mtime": p.stat().st_mtime,
-                    }
-                )
-        files.sort(key=lambda f: f["name"].lower())
+        for p in BASE_DIR.rglob("*.md"):
+            rel = str(p.relative_to(BASE_DIR)).replace("\\", "/")
+            files.append(
+                {
+                    "name": p.name,
+                    "path": rel,
+                    "size": p.stat().st_size,
+                    "mtime": p.stat().st_mtime,
+                }
+            )
+        files.sort(key=lambda f: f["path"].lower())
         self._json(files)
 
     def _search_files(self, query_string):
@@ -571,60 +864,88 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not q:
             return self._json([])
 
-        results = []
         q_lower = q.lower()
+        self._ensure_index()
+
+        results = []
         seen = set()
 
-        for p in BASE_DIR.iterdir():
-            if not p.is_file() or p.suffix.lower() != ".md":
-                continue
-            try:
-                content = self._read_cached(p)
-                idx = content.lower().find(q_lower)
-                if idx >= 0:
-                    start = max(0, idx - 40)
-                    end = min(len(content), idx + len(q) + 40)
-                    snip = content[start:end].replace("\n", " ")
-                    if start > 0:
-                        snip = "..." + snip
-                    if end < len(content):
-                        snip = snip + "..."
-                    results.append({"name": p.name, "snippet": snip})
-                    seen.add(p.name)
-            except Exception:
-                pass
+        def _snippet(content, idx, q_len):
+            s = max(0, idx - 40)
+            e = min(len(content), idx + q_len + 40)
+            snip = content[s:e].replace("\n", " ")
+            if s > 0:
+                snip = "..." + snip
+            if e < len(content):
+                snip = snip + "..."
+            return snip
 
-        # also match by filename
-        for p in BASE_DIR.iterdir():
-            if not p.is_file() or p.suffix.lower() != ".md":
-                continue
-            if q_lower in p.name.lower() and p.name not in seen:
-                results.append({"name": p.name, "snippet": ""})
+        # Word-indexed search
+        terms = re.findall(r"[\u4e00-\u9fff\w]{2,}", q_lower)
+        if terms and _INDEX:
+            candidates = None
+            for t in terms:
+                files = _INDEX.get(t, set())
+                candidates = files if candidates is None else candidates & files
+                if not candidates:
+                    break
+            if candidates:
+                for rel in candidates:
+                    filepath = BASE_DIR / rel
+                    try:
+                        content = self._read_cached(filepath, rel)
+                        idx = content.lower().find(q_lower)
+                        if idx >= 0:
+                            results.append({
+                                "path": rel,
+                                "name": filepath.name,
+                                "snippet": _snippet(content, idx, len(q)),
+                            })
+                            seen.add(rel)
+                    except Exception:
+                        pass
 
-        results.sort(key=lambda r: r["name"].lower())
+        # Fallback: full scan for queries without word hits
+        if not seen and (not terms or not _INDEX):
+            for p in BASE_DIR.rglob("*.md"):
+                rel = str(p.relative_to(BASE_DIR)).replace("\\", "/")
+                try:
+                    content = self._read_cached(p, rel)
+                    idx = content.lower().find(q_lower)
+                    if idx >= 0:
+                        results.append({
+                            "path": rel,
+                            "name": p.name,
+                            "snippet": _snippet(content, idx, len(q)),
+                        })
+                        seen.add(rel)
+                except Exception:
+                    pass
+
+        # Filename / path match fallback
+        for p in BASE_DIR.rglob("*.md"):
+            rel = str(p.relative_to(BASE_DIR)).replace("\\", "/")
+            if q_lower in rel.lower() and rel not in seen:
+                results.append({"path": rel, "name": p.name, "snippet": ""})
+
+        results.sort(key=lambda r: r["path"].lower())
         self._json(results)
 
     def _get_file(self, query_string):
         params = parse_qs(query_string)
-        name = params.get("name", [None])[0]
-        if not name:
-            return self._json({"error": "Missing name"}, 400)
-        if ".." in name or "/" in name or "\\" in name:
-            return self._json({"error": "Invalid filename"}, 400)
+        filepath_str = params.get("path", [None])[0]
+        if not filepath_str:
+            return self._json({"error": "Missing path"}, 400)
 
-        filepath = BASE_DIR / name
-        filepath = filepath.resolve()
-        try:
-            filepath.relative_to(BASE_DIR)
-        except ValueError:
-            return self._json({"error": "Access denied"}, 403)
-        if not filepath.exists() or not filepath.is_file():
+        filepath = self._safe_resolve(filepath_str)
+        if not filepath or not filepath.exists() or not filepath.is_file():
             return self._json({"error": "File not found"}, 404)
         if filepath.suffix.lower() != ".md":
             return self._json({"error": "Not a markdown file"}, 400)
 
-        content = self._read_cached(filepath)
-        self._json({"name": name, "content": content})
+        rel = str(filepath.relative_to(BASE_DIR)).replace("\\", "/")
+        content = self._read_cached(filepath, rel)
+        self._json({"path": rel, "name": filepath.name, "content": content})
 
     def _save_file(self, body):
         try:
@@ -632,42 +953,154 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             return self._json({"error": "Invalid JSON"}, 400)
 
-        name = data.get("name", "")
+        filepath_str = data.get("path", "")
         content = data.get("content", "")
-        if not name:
-            return self._json({"error": "Missing name"}, 400)
-        if not name.lower().endswith(".md"):
+        if not filepath_str:
+            return self._json({"error": "Missing path"}, 400)
+        if not filepath_str.lower().endswith(".md"):
             return self._json({"error": "Must be .md file"}, 400)
-        if ".." in name or "/" in name or "\\" in name:
-            return self._json({"error": "Invalid filename"}, 400)
 
-        filepath = BASE_DIR / name
+        filepath = self._safe_resolve(filepath_str)
+        if not filepath:
+            return self._json({"error": "Invalid path"}, 400)
+
+        filepath.parent.mkdir(parents=True, exist_ok=True)
         filepath.write_text(content, encoding="utf-8")
-        _CONTENT_CACHE[name] = (filepath.stat().st_mtime, content)
-        self._json({"ok": True, "name": name})
+        rel = str(filepath.relative_to(BASE_DIR)).replace("\\", "/")
+        _CONTENT_CACHE[rel] = (filepath.stat().st_mtime, content)
+        self._mark_index_dirty()
+        self._json({"ok": True, "path": rel})
 
     def _delete_file(self, query_string):
         params = parse_qs(query_string)
-        name = params.get("name", [None])[0]
-        if not name:
-            return self._json({"error": "Missing name"}, 400)
-        if ".." in name or "/" in name or "\\" in name:
-            return self._json({"error": "Invalid filename"}, 400)
+        filepath_str = params.get("path", [None])[0]
+        if not filepath_str:
+            return self._json({"error": "Missing path"}, 400)
 
-        filepath = BASE_DIR / name
-        filepath = filepath.resolve()
-        try:
-            filepath.relative_to(BASE_DIR)
-        except ValueError:
-            return self._json({"error": "Access denied"}, 403)
-        if not filepath.exists():
+        filepath = self._safe_resolve(filepath_str)
+        if not filepath or not filepath.exists() or not filepath.is_file():
             return self._json({"error": "File not found"}, 404)
         if filepath.suffix.lower() != ".md":
             return self._json({"error": "Not a markdown file"}, 400)
 
+        rel = str(filepath.relative_to(BASE_DIR)).replace("\\", "/")
         filepath.unlink()
-        _CONTENT_CACHE.pop(name, None)
+        _CONTENT_CACHE.pop(rel, None)
+        self._mark_index_dirty()
         self._json({"ok": True})
+
+    def _make_dir(self, body):
+        try:
+            data = json.loads(body)
+        except json.JSONDecodeError:
+            return self._json({"error": "Invalid JSON"}, 400)
+
+        dirpath_str = data.get("path", "")
+        if not dirpath_str:
+            return self._json({"error": "Missing path"}, 400)
+
+        dirpath = self._safe_resolve(dirpath_str)
+        if not dirpath:
+            return self._json({"error": "Invalid path"}, 400)
+        if dirpath.exists():
+            return self._json({"error": "Already exists"}, 409)
+
+        dirpath.mkdir(parents=True, exist_ok=True)
+        self._json({"ok": True, "path": dirpath_str})
+
+    def _remove_dir(self, query_string):
+        params = parse_qs(query_string)
+        dirpath_str = params.get("path", [None])[0]
+        if not dirpath_str:
+            return self._json({"error": "Missing path"}, 400)
+
+        dirpath = self._safe_resolve(dirpath_str)
+        if not dirpath or not dirpath.exists() or not dirpath.is_dir():
+            return self._json({"error": "Directory not found"}, 404)
+        if dirpath == BASE_DIR:
+            return self._json({"error": "Cannot delete root"}, 400)
+
+        # Remove cache entries for files inside this dir
+        prefix = dirpath_str.replace("\\", "/") + "/"
+        for key in list(_CONTENT_CACHE.keys()):
+            if key == dirpath_str or key.startswith(prefix):
+                del _CONTENT_CACHE[key]
+
+        # Recursively delete
+        import shutil
+        shutil.rmtree(str(dirpath))
+        self._mark_index_dirty()
+        self._json({"ok": True})
+
+    def _move(self, body):
+        try:
+            data = json.loads(body)
+        except json.JSONDecodeError:
+            return self._json({"error": "Invalid JSON"}, 400)
+        src = data.get("from", "")
+        dst = data.get("to", "")
+        if not src:
+            return self._json({"error": "Missing from"}, 400)
+        src_path = self._safe_resolve(src)
+        dst_path = self._safe_resolve(dst) if dst else BASE_DIR
+        if not src_path or not src_path.exists():
+            return self._json({"error": "Source not found"}, 404)
+        if not dst_path or not dst_path.is_dir():
+            return self._json({"error": "Destination must be a directory"}, 400)
+        if src_path == BASE_DIR:
+            return self._json({"error": "Cannot move root"}, 400)
+        try:
+            dst_path.relative_to(src_path)
+            return self._json({"error": "Cannot move into itself"}, 400)
+        except ValueError:
+            pass
+        new_name = data.get("name", "")
+        target = dst_path / (new_name if new_name else src_path.name)
+        if target.resolve() == src_path.resolve():
+            new_path = str(target.relative_to(BASE_DIR)).replace("\\", "/")
+            return self._json({"ok": True, "from": src, "to": new_path})
+        if target.exists():
+            return self._json({"error": "Target already exists"}, 409)
+        shutil.move(str(src_path), str(target))
+        # Invalidate cache for moved paths
+        prefix = src.replace("\\", "/") + "/"
+        for k in list(_CONTENT_CACHE.keys()):
+            if k == src or k.startswith(prefix):
+                del _CONTENT_CACHE[k]
+        self._mark_index_dirty()
+        new_path = str(target.relative_to(BASE_DIR)).replace("\\", "/")
+        self._json({"ok": True, "from": src, "to": new_path})
+
+    def _rename(self, body):
+        try:
+            data = json.loads(body)
+        except json.JSONDecodeError:
+            return self._json({"error": "Invalid JSON"}, 400)
+        old = data.get("from", "")
+        name = data.get("name", "")
+        if not old or not name:
+            return self._json({"error": "Missing from/name"}, 400)
+        src_path = self._safe_resolve(old)
+        if not src_path or not src_path.exists():
+            return self._json({"error": "Source not found"}, 404)
+        if src_path == BASE_DIR:
+            return self._json({"error": "Cannot rename root"}, 400)
+        if "/" in name or ".." in name:
+            return self._json({"error": "Invalid name"}, 400)
+        target = src_path.parent / name
+        if target.resolve() == src_path.resolve():
+            new_rel = str(target.relative_to(BASE_DIR)).replace("\\", "/")
+            return self._json({"ok": True, "from": old, "to": new_rel})
+        if target.exists():
+            return self._json({"error": "Target already exists"}, 409)
+        shutil.move(str(src_path), str(target))
+        prefix = old.replace("\\", "/") + "/"
+        for k in list(_CONTENT_CACHE.keys()):
+            if k == old or k.startswith(prefix):
+                del _CONTENT_CACHE[k]
+        self._mark_index_dirty()
+        new_rel = str(target.relative_to(BASE_DIR)).replace("\\", "/")
+        self._json({"ok": True, "from": old, "to": new_rel})
 
     def _upload_image(self, body):
         try:
@@ -678,6 +1111,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         img_b64 = data.get("data", "")
         if not img_b64 or "," not in img_b64:
             return self._json({"error": "Invalid image data"}, 400)
+
+        target_dir_str = data.get("dir", "").strip()
 
         try:
             header, encoded = img_b64.split(",", 1)
@@ -694,12 +1129,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
             raw = base64.b64decode(encoded)
             filename = f"{uuid.uuid4().hex[:8]}.{ext}"
-            filepath = BASE_DIR / filename
+
+            if target_dir_str:
+                target_dir = self._safe_resolve(target_dir_str)
+                if not target_dir:
+                    target_dir = BASE_DIR
+                target_dir.mkdir(parents=True, exist_ok=True)
+            else:
+                target_dir = BASE_DIR
+
+            filepath = target_dir / filename
             while filepath.exists():
                 filename = f"{uuid.uuid4().hex[:8]}.{ext}"
-                filepath = BASE_DIR / filename
+                filepath = target_dir / filename
+
             filepath.write_bytes(raw)
-            self._json({"url": f"/{filename}"})
+            rel = str(filepath.relative_to(BASE_DIR)).replace("\\", "/")
+            self._json({"url": f"/{rel}"})
         except Exception as e:
             self._json({"error": str(e)}, 500)
 
@@ -708,13 +1154,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not rel:
             return self._json({"error": "Not found"}, 404)
 
-        filepath = BASE_DIR / rel
-        filepath = filepath.resolve()
-        try:
-            filepath.relative_to(BASE_DIR)
-        except ValueError:
-            return self._json({"error": "Access denied"}, 403)
-        if not filepath.exists() or not filepath.is_file():
+        filepath = self._safe_resolve(rel)
+        if not filepath or not filepath.exists() or not filepath.is_file():
             return self._json({"error": "Not found"}, 404)
 
         ext = filepath.suffix.lower()

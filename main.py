@@ -100,7 +100,10 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;d
 <body>
 <div id="sidebar">
   <div id="sidebar-header">
-    <h2>📝 Files</h2>
+    <h2>📝 Files
+      <button onclick="expandAll()" title="Expand all" style="float:right;background:none;border:1px solid #ddd;border-radius:3px;cursor:pointer;font-size:12px;padding:1px 6px;color:#888">⊞</button>
+      <button onclick="collapseAll()" title="Collapse all" style="float:right;background:none;border:1px solid #ddd;border-radius:3px;cursor:pointer;font-size:12px;padding:1px 6px;color:#888;margin-right:2px">⊟</button>
+    </h2>
     <input id="search-box" type="text" placeholder="Search..." oninput="onSearch()">
     <div class="hdr-actions">
       <button onclick="createFile('')">+ File</button>
@@ -232,6 +235,28 @@ function toggleDir(el) {
     var c = el.nextElementSibling;
     if (c && c.classList.contains('tree-children')) {
         c.style.display = c.style.display === 'none' ? 'block' : 'none';
+    }
+}
+
+function expandAll() {
+    var dirs = document.querySelectorAll('.tree-dir');
+    for (var i = 0; i < dirs.length; i++) {
+        dirs[i].classList.add('open');
+        var c = dirs[i].nextElementSibling;
+        if (c && c.classList.contains('tree-children')) {
+            c.style.display = 'block';
+        }
+    }
+}
+
+function collapseAll() {
+    var dirs = document.querySelectorAll('.tree-dir');
+    for (var i = 0; i < dirs.length; i++) {
+        dirs[i].classList.remove('open');
+        var c = dirs[i].nextElementSibling;
+        if (c && c.classList.contains('tree-children')) {
+            c.style.display = 'none';
+        }
     }
 }
 

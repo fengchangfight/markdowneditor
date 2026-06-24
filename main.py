@@ -38,6 +38,10 @@ USERNAME = os.environ.get("MDEDITOR_USER", "fengchang")
 PASSWORD = os.environ.get("MDEDITOR_PASS", "Passw0rd")
 SESSIONS = {}  # token -> expiry (timestamp)
 
+# Custom order: {dir_path: [name, name, ...]}
+_ORDER_FILE = BASE_DIR / ".mdeditor_order.json"
+_ORDER = None
+
 HTML = r"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -78,6 +82,9 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;d
 .file-item .ren-btn{visibility:hidden;background:none;border:none;color:#888;cursor:pointer;font-size:14px;padding:0 4px}
 .file-item:hover .ren-btn{visibility:visible}
 .file-item .ren-btn:hover{color:#333}
+.file-item .mvu,.file-item .mvd{visibility:hidden;background:none;border:none;color:#aaa;cursor:pointer;font-size:12px;padding:0 2px}
+.file-item:hover .mvu,.file-item:hover .mvd{visibility:visible}
+.file-item .mvu:hover,.file-item .mvd:hover{color:#333}
 #main{flex:1;display:flex;flex-direction:column;overflow:hidden}
 #toolbar{padding:8px 14px;border-bottom:1px solid #e0e0e0;background:#fff;display:flex;align-items:center;gap:10px;flex-shrink:0}
 #toolbar #current-file{font-size:14px;color:#333;font-weight:500}
@@ -205,11 +212,14 @@ function buildTreeHTML(nodes, depth) {
     var html = '';
     for (var i = 0; i < nodes.length; i++) {
         var n = nodes[i];
+        var parent = n.path.substring(0, n.path.lastIndexOf('/'));
         if (n.type === 'dir') {
             html += '<div class="tree-dir" data-path="' + esc(n.path) + '" style="padding-left:' + (8 + depth * 14) + 'px" onclick="toggleDir(this)" draggable="true" ondragstart="dragStart(event,\'dir\',\'' + esc(n.path) + '\')" ondragend="dragEnd(event)" ondragover="dragOver(event)" ondragleave="dragLeave(event)" ondrop="dropOnDir(event,\'' + esc(n.path) + '\')">';
             html += '<span class="arrow">▶</span>';
             html += '<span class="dname">📁 ' + esc(n.name) + '</span>';
             html += '<span class="dact">';
+            html += '<button title="Move up" onclick="event.stopPropagation();reorderItem(\'' + esc(parent) + '\',\'' + esc(n.name) + '\',\'up\')">▲</button>';
+            html += '<button title="Move down" onclick="event.stopPropagation();reorderItem(\'' + esc(parent) + '\',\'' + esc(n.name) + '\',\'down\')">▼</button>';
             html += '<button title="Rename" onclick="event.stopPropagation();startRename(this,\'dir\',\'' + esc(n.path) + '\')">✏</button>';
             html += '<button title="New File" onclick="event.stopPropagation();createFile(\'' + esc(n.path) + '\')">+📄</button>';
             html += '<button title="New Dir" onclick="event.stopPropagation();createDir(\'' + esc(n.path) + '\')">+📁</button>';
@@ -222,6 +232,8 @@ function buildTreeHTML(nodes, depth) {
             var cls = (currentFile === n.path) ? ' file-item active' : ' file-item';
             html += '<div class="' + cls + '" style="padding-left:' + (26 + depth * 14) + 'px" onclick="openFile(\'' + esc(n.path) + '\')" draggable="true" ondragstart="dragStart(event,\'file\',\'' + esc(n.path) + '\')" ondragend="dragEnd(event)">';
             html += '📄 <span class="fname">' + esc(n.name) + '</span>';
+            html += '<button class="mvu" title="Move up" onclick="event.stopPropagation();reorderItem(\'' + esc(parent) + '\',\'' + esc(n.name) + '\',\'up\')">▲</button>';
+            html += '<button class="mvd" title="Move down" onclick="event.stopPropagation();reorderItem(\'' + esc(parent) + '\',\'' + esc(n.name) + '\',\'down\')">▼</button>';
             html += '<button class="ren-btn" onclick="event.stopPropagation();startRename(this,\'file\',\'' + esc(n.path) + '\')">✏</button>';
             html += '<button class="del-btn" onclick="event.stopPropagation();delFile(\'' + esc(n.path) + '\')">×</button>';
             html += '</div>';
@@ -548,6 +560,16 @@ function doRename(oldPath, newName) {
     });
 }
 
+function reorderItem(parent, name, dir) {
+    fetch('/api/reorder', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({parent: parent, name: name, direction: dir})
+    }).then(function(r){ return r.json() }).then(function(d){
+        if (d.ok) { loadTree(); }
+    });
+}
+
 document.addEventListener('keydown', function(e) {
     if ((e.ctrlKey || e.metaKey) && e.key === 's') {
         e.preventDefault();
@@ -698,6 +720,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._move(body)
         elif path == "/api/rename":
             self._rename(body)
+        elif path == "/api/reorder":
+            self._reorder(body)
         else:
             self._json({"error": "Not found"}, 404)
 
@@ -780,21 +804,62 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except Exception:
             pass
 
+    def _load_order(self):
+        global _ORDER
+        if _ORDER is not None:
+            return
+        if _ORDER_FILE.exists():
+            try:
+                _ORDER = json.loads(_ORDER_FILE.read_text(encoding="utf-8"))
+            except Exception:
+                _ORDER = {}
+        else:
+            _ORDER = {}
+
+    def _save_order(self):
+        global _ORDER
+        if _ORDER is None:
+            return
+        try:
+            _ORDER_FILE.write_text(json.dumps(_ORDER, ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            pass
+
     def _build_tree(self, base_path=None, rel_prefix=""):
         if base_path is None:
             base_path = BASE_DIR
+        self._load_order()
         result = []
         try:
-            entries = sorted(
-                base_path.iterdir(),
-                key=lambda p: (not p.is_dir(), p.name.lower()),
-            )
+            entries = list(base_path.iterdir())
         except OSError:
             return result
 
-        for entry in entries:
-            if entry.name.startswith("."):
+        # Separate dirs and md files, exclude hidden
+        dirs = []
+        files = []
+        for e in entries:
+            if e.name.startswith("."):
                 continue
+            if e.is_dir():
+                dirs.append(e)
+            elif e.suffix.lower() == ".md":
+                files.append(e)
+
+        # Sort by custom order
+        dir_key = rel_prefix.replace("\\", "/")
+        order = _ORDER.get(dir_key, [])
+        name_map = {e.name: e for e in dirs + files}
+
+        ordered = []
+        for name in order:
+            if name in name_map:
+                ordered.append(name_map.pop(name))
+        # Remaining sorted by type then name
+        remaining = sorted(name_map.values(), key=lambda e: (not e.is_dir(), e.name.lower()))
+        ordered.extend(remaining)
+
+        for entry in ordered:
             rel = (
                 (rel_prefix + "/" + entry.name).lstrip("/")
                 if rel_prefix
@@ -812,7 +877,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         "children": children,
                     }
                 )
-            elif entry.suffix.lower() == ".md":
+            else:
                 result.append(
                     {"name": entry.name, "path": rel, "type": "file"}
                 )
@@ -1132,6 +1197,38 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self._mark_index_dirty()
         new_rel = str(target.relative_to(BASE_DIR)).replace("\\", "/")
         self._json({"ok": True, "from": old, "to": new_rel})
+
+    def _reorder(self, body):
+        try:
+            data = json.loads(body)
+        except json.JSONDecodeError:
+            return self._json({"error": "Invalid JSON"}, 400)
+        parent = data.get("parent", "")
+        name = data.get("name", "")
+        direction = data.get("direction", "up")
+        if not name:
+            return self._json({"error": "Missing name"}, 400)
+        self._load_order()
+        order = _ORDER.get(parent, [])
+        if not order:
+            # Build initial order from current tree
+            parent_path = self._safe_resolve(parent) if parent else BASE_DIR
+            if parent_path and parent_path.is_dir():
+                entries = sorted(
+                    parent_path.iterdir(),
+                    key=lambda p: (not p.is_dir(), p.name.lower()),
+                )
+                order = [e.name for e in entries if not e.name.startswith(".") and (e.is_dir() or e.suffix.lower() == ".md")]
+        if name not in order:
+            order.append(name)
+        idx = order.index(name)
+        if direction == "up" and idx > 0:
+            order[idx], order[idx - 1] = order[idx - 1], order[idx]
+        elif direction == "down" and idx < len(order) - 1:
+            order[idx], order[idx + 1] = order[idx + 1], order[idx]
+        _ORDER[parent] = order
+        self._save_order()
+        self._json({"ok": True})
 
     def _upload_image(self, body):
         try:

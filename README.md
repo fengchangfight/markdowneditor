@@ -21,6 +21,8 @@ python main.py
 
 Open http://127.0.0.1:8765 in your browser.
 
+![screenshot](samplemarkdown.png)
+
 ## Custom Credentials
 
 ```bash

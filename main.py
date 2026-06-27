@@ -23,6 +23,7 @@ BASE_DIR = Path(__file__).parent.resolve()
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp", ".ico"}
 TEXT_EXTS = {".css", ".js", ".md", ".html", ".txt", ".json", ".xml", ".csv"}
+PY_EXTS = {".py", ".pyc", ".pyo", ".pyd"}
 
 # In-memory content cache: relpath -> (mtime, content)
 _CONTENT_CACHE = {}
@@ -97,6 +98,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;d
 #toolbar button.danger{background:#e74c3c}
 #toolbar button.danger:hover{background:#c0392b}
 #editor-container{flex:1;overflow:hidden}
+#editor-container.file-drag-over{outline:3px dashed #4a90d9;outline-offset:-3px;background:rgba(74,144,217,0.03)}
 .toastui-editor-defaultUI{border:none!important;border-radius:0!important}
 #editor-container.src-only .toastui-editor-md-preview{display:none!important}
 #editor-container.prv-only .toastui-editor-md-editor{display:none!important}
@@ -613,6 +615,26 @@ function downloadZip(dirPath) {
     document.body.removeChild(a);
 }
 
+function uploadAndInsert(file) {
+    var reader = new FileReader();
+    reader.onload = function(e) {
+        var dir = currentFile ? currentFile.substring(0, currentFile.lastIndexOf('/') + 1) : '';
+        fetch('/api/upload', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({data: e.target.result, dir: dir, filename: file.name})
+        }).then(function(r){ return r.json() }).then(function(d){
+            var ext = file.name.split('.').pop().toLowerCase();
+            var isImage = ['png','jpg','jpeg','gif','webp','svg','bmp','ico'].indexOf(ext) >= 0;
+            var md = isImage ? '![' + file.name + '](' + d.url + ')' : '[' + file.name + '](' + d.url + ')';
+            editor.insertText(md);
+        }).catch(function(err){
+            console.error('Upload failed:', err);
+        });
+    };
+    reader.readAsDataURL(file);
+}
+
 document.addEventListener('keydown', function(e) {
     if ((e.ctrlKey || e.metaKey) && e.key === 's') {
         e.preventDefault();
@@ -663,6 +685,50 @@ function hl(text, q) {
 
 initEditor();
 loadTree();
+
+(function(){
+    var ec = document.getElementById('editor-container');
+    var dragCounter = 0;
+
+    function isInEditor(el) {
+        return ec && ec.contains(el);
+    }
+
+    document.addEventListener('dragenter', function(e) {
+        if (!isInEditor(e.target)) return;
+        e.preventDefault();
+        dragCounter++;
+        ec.classList.add('file-drag-over');
+    }, true);
+
+    document.addEventListener('dragleave', function(e) {
+        if (!isInEditor(e.target)) return;
+        dragCounter--;
+        if (dragCounter <= 0) {
+            dragCounter = 0;
+            ec.classList.remove('file-drag-over');
+        }
+    }, true);
+
+    document.addEventListener('dragover', function(e) {
+        if (!isInEditor(e.target)) return;
+        e.preventDefault();
+        e.dataTransfer.dropEffect = 'copy';
+    }, true);
+
+    document.addEventListener('drop', function(e) {
+        if (!isInEditor(e.target)) return;
+        e.preventDefault();
+        e.stopPropagation();
+        dragCounter = 0;
+        ec.classList.remove('file-drag-over');
+        var files = e.dataTransfer.files;
+        if (!files || files.length === 0) return;
+        for (var i = 0; i < files.length; i++) {
+            uploadAndInsert(files[i]);
+        }
+    }, true);
+})();
 
 var resizeHandle = document.getElementById('resize-handle');
 var sidebarEl = document.getElementById('sidebar');
@@ -1291,12 +1357,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             for p in base.rglob("*"):
                 if not p.is_file():
                     continue
+                parts = p.relative_to(base).parts
+                if any(part.startswith(".") for part in parts):
+                    continue
+                if p.name == "main.py":
+                    continue
                 ext = p.suffix.lower()
-                if (
-                    ext != ".md"
-                    and ext not in IMAGE_EXTS
-                    and p.name != ".mdeditor_order.json"
-                ):
+                if ext in PY_EXTS:
                     continue
                 arcname = str(p.relative_to(base)).replace("\\", "/")
                 zf.write(str(p), arcname)
@@ -1437,27 +1504,32 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             return self._json({"error": "Invalid JSON"}, 400)
 
-        img_b64 = data.get("data", "")
-        if not img_b64 or "," not in img_b64:
-            return self._json({"error": "Invalid image data"}, 400)
+        b64 = data.get("data", "")
+        if not b64 or "," not in b64:
+            return self._json({"error": "Invalid data"}, 400)
 
         target_dir_str = data.get("dir", "").strip()
+        original_name = data.get("filename", "").strip()
 
         try:
-            header, encoded = img_b64.split(",", 1)
-            ext = "png"
-            m = re.search(r"image/(\w+)", header)
-            if m:
-                ext = m.group(1)
-                if ext == "jpeg":
-                    ext = "jpg"
-                if ext not in ("png", "jpg", "jpeg", "gif", "webp", "bmp", "svg+xml"):
-                    ext = "png"
-                if ext == "svg+xml":
-                    ext = "svg"
-
+            header, encoded = b64.split(",", 1)
             raw = base64.b64decode(encoded)
-            filename = f"{uuid.uuid4().hex[:8]}.{ext}"
+
+            if original_name:
+                safe_name = re.sub(r'[\\/:*?"<>|]', "_", original_name)
+                if not safe_name:
+                    safe_name = f"{uuid.uuid4().hex[:8]}"
+                filename = safe_name
+            else:
+                m = re.search(r"image/(\w+)", header)
+                ext = "png"
+                if m:
+                    ext = m.group(1)
+                    if ext == "jpeg":
+                        ext = "jpg"
+                    if ext == "svg+xml":
+                        ext = "svg"
+                filename = f"{uuid.uuid4().hex[:8]}.{ext}"
 
             if target_dir_str:
                 target_dir = self._safe_resolve(target_dir_str)
@@ -1468,13 +1540,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 target_dir = BASE_DIR
 
             filepath = target_dir / filename
-            while filepath.exists():
-                filename = f"{uuid.uuid4().hex[:8]}.{ext}"
-                filepath = target_dir / filename
+            if filepath.exists():
+                stem, ext = os.path.splitext(filename)
+                counter = 1
+                while filepath.exists():
+                    filename = f"{stem}-{counter}{ext}"
+                    filepath = target_dir / filename
+                    counter += 1
 
             filepath.write_bytes(raw)
             rel = str(filepath.relative_to(BASE_DIR)).replace("\\", "/")
-            self._json({"url": f"/{rel}"})
+            self._json({"url": f"/{rel}", "filename": filename})
         except Exception as e:
             self._json({"error": str(e)}, 500)
 
@@ -1486,10 +1562,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
         filepath = self._safe_resolve(rel)
         if not filepath or not filepath.exists() or not filepath.is_file():
             return self._json({"error": "Not found"}, 404)
-
-        ext = filepath.suffix.lower()
-        if ext not in IMAGE_EXTS and ext not in TEXT_EXTS:
-            return self._json({"error": "Forbidden"}, 403)
 
         ct = mimetypes.guess_type(str(filepath))[0] or "application/octet-stream"
         size = filepath.stat().st_size

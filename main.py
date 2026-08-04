@@ -754,6 +754,22 @@ function stopResize() {
     document.removeEventListener('mousemove', onResize);
     document.removeEventListener('mouseup', stopResize);
 }
+
+function startSessionCheck() {
+    setInterval(function() {
+        fetch('/api/check_session')
+            .then(function(r) {
+                if (!r.ok) {
+                    location.href = '/';
+                }
+            })
+            .catch(function() {
+                location.href = '/';
+            });
+    }, 30000);
+}
+
+startSessionCheck();
 </script>
 </body>
 </html>"""
@@ -822,6 +838,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._serve_login_page()
         elif not self._check_auth():
             self._json({"error": "Unauthorized"}, 401)
+        elif path == "/api/check_session":
+            self._json({"ok": True})
         elif path == "/api/tree":
             self._tree()
         elif path == "/api/files":
@@ -1358,7 +1376,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if not p.is_file():
                     continue
                 parts = p.relative_to(base).parts
-                if any(part.startswith(".") for part in parts):
+                if any(part.startswith(".") and part != ".attachment" for part in parts):
                     continue
                 if p.name == "main.py":
                     continue
@@ -1535,9 +1553,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 target_dir = self._safe_resolve(target_dir_str)
                 if not target_dir:
                     target_dir = BASE_DIR
-                target_dir.mkdir(parents=True, exist_ok=True)
             else:
                 target_dir = BASE_DIR
+            target_dir = target_dir / ".attachment"
+            target_dir.mkdir(parents=True, exist_ok=True)
 
             filepath = target_dir / filename
             if filepath.exists():
